@@ -14,7 +14,13 @@
 
 要求 Python 3.11 或更新版本。无需 MySQL、Docker、Milvus 或模型密钥即可运行演示模式。
 
-从项目的父目录 `04-代码` 执行：
+首次从 GitHub 获取项目时，在你准备存放项目的目录执行（保留下面的本地目录名，供 Python 包导入使用）：
+
+```powershell
+git clone https://github.com/aejqlejql/smartvoyage.git ai01_SmartVoyage
+```
+
+以下 Python 命令在 `ai01_SmartVoyage` 的父目录执行；本机已有项目对应父目录 `04-代码`：
 
 ```powershell
 python -m pip install -r ai01_SmartVoyage/requirements-demo.txt

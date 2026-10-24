@@ -1,0 +1,4 @@
+# Python 3.11+. Versions verified on the local development machine.
+fastapi==0.137.2
+pydantic==2.13.3
+uvicorn==0.46.0

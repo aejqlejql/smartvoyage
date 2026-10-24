@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 SMARTVOYAGE_MODE=demo SMARTVOYAGE_API_HOST=0.0.0.0 SMARTVOYAGE_APP_DB=/data/smartvoyage.sqlite3
+WORKDIR /app
+COPY requirements-demo.txt /tmp/requirements-demo.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-demo.txt \
+    && useradd --uid 10001 --create-home voyage \
+    && mkdir /data && chown voyage:voyage /data
+COPY . /app/ai01_SmartVoyage
+USER voyage
+EXPOSE 8080
+CMD ["python", "-m", "ai01_SmartVoyage.api.server"]

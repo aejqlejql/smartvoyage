@@ -1,0 +1,21 @@
+name: Personal project checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  demo-acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ai01_SmartVoyage
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r ai01_SmartVoyage/requirements-dev.txt
+      - run: python -m ai01_SmartVoyage.scripts.verify --product-only
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m ai01_SmartVoyage.scripts.browser_acceptance
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-acceptance
+          path: ai01_SmartVoyage/artifacts/browser/

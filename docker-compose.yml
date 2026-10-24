@@ -1,0 +1,292 @@
+# ============================================================
+# SmartVoyage 一键编排部署文件
+#
+# 作用：用 Docker Compose 拉起整套微服务，包括：
+#   - mysql       关系数据库（票务/天气/租车/保险/记忆等结构化数据）
+#   - weather/ticket/trip-mcp  三个 MCP 工具服务（数据访问层）
+#   - weather/ticket/trip-a2a  三个 A2A 专家服务（对话编排层）
+#   - api         主 FastAPI 服务（页面 + REST/SSE 接口）
+#   - etcd/minio/milvus  可选向量检索组件（通过 --profile vectors 启用）
+#
+# 启动命令：
+#   docker compose up -d              # 启动核心服务（不含 Milvus）
+#   docker compose --profile vectors up -d   # 连带启动 Milvus 向量检索
+#
+# 说明：
+#   - 下面两个 x- 开头的扩展字段是 YAML 锚点（anchor），通过 <<: *xxx 复用，
+#     避免在每个服务里重复写大量相同的环境变量和构建配置。
+# ============================================================
+
+# ---- 共享环境变量锚点：所有 Python 服务共用的配置 ----
+x-smartvoyage-env: &smartvoyage-env
+  DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}           # 通义千问 API 密钥（LLM 与 Embedding）
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}                 # 兼容 OpenAI 格式的备用密钥
+  LLM_BASE_URL: ${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}  # LLM 接口地址
+  LLM_MODEL_NAME: ${LLM_MODEL_NAME:-qwen-plus}        # 默认大模型名称
+  SMARTVOYAGE_DB_HOST: mysql                          # 数据库主机（指向 compose 内的 mysql 服务名）
+  SMARTVOYAGE_DB_PORT: "3306"                         # 数据库端口
+  SMARTVOYAGE_DB_USER: root                           # 数据库用户名
+  SMARTVOYAGE_DB_PASSWORD: ${SMARTVOYAGE_DB_PASSWORD:-smartvoyage}  # 数据库密码
+  SMARTVOYAGE_DB_NAME: ${SMARTVOYAGE_DB_NAME:-travel_rag}           # 数据库名
+  SMARTVOYAGE_DB_CONNECT_TIMEOUT: ${SMARTVOYAGE_DB_CONNECT_TIMEOUT:-5}  # 连接超时
+  SMARTVOYAGE_WEATHER_SOURCE: ${SMARTVOYAGE_WEATHER_SOURCE:-db}      # 天气数据源：db/api
+  QWEATHER_API_KEY: ${QWEATHER_API_KEY:-}             # 和风天气 API 密钥
+  QWEATHER_BASE_URL: ${QWEATHER_BASE_URL:-https://j246h349g7.re.qweatherapi.com/v7/weather/30d}  # 天气接口
+  QWEATHER_API_HOST: ${QWEATHER_API_HOST:-geoapi.qweather.com}        # 城市查询接口主机
+  SMARTVOYAGE_TIMEZONE: ${SMARTVOYAGE_TIMEZONE:-Asia/Shanghai}        # 时区
+  MILVUS_HOST: milvus                                 # Milvus 服务名
+  MILVUS_PORT: "19530"                                # Milvus 端口
+  MILVUS_COLLECTION: ${MILVUS_COLLECTION:-tour_groups}   # 旅游团向量集合名
+  EMBEDDING_URL: ${EMBEDDING_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings}  # Embedding 接口
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}               # 向量维度
+  # MCP 服务绑定地址（0.0.0.0 允许容器网络内访问）与端口
+  TICKET_MCP_BIND_HOST: 0.0.0.0
+  WEATHER_MCP_BIND_HOST: 0.0.0.0
+  TRIP_MCP_BIND_HOST: 0.0.0.0
+  TICKET_MCP_PORT: "8001"
+  WEATHER_MCP_PORT: "8002"
+  TRIP_MCP_PORT: "8003"
+  # A2A 服务通过容器服务名访问对应的 MCP
+  TICKET_MCP_URL: http://ticket-mcp:8001
+  WEATHER_MCP_URL: http://weather-mcp:8002
+  TRIP_MCP_URL: http://trip-mcp:8003
+  # A2A 服务绑定地址与端口
+  WEATHER_A2A_BIND_HOST: 0.0.0.0
+  TICKET_A2A_BIND_HOST: 0.0.0.0
+  TRIP_A2A_BIND_HOST: 0.0.0.0
+  WEATHER_A2A_PORT: "5005"
+  TICKET_A2A_PORT: "5006"
+  TRIP_A2A_PORT: "5007"
+  # 主服务通过容器服务名访问对应的 A2A 专家
+  WEATHER_A2A_URL: http://weather-a2a:5005
+  TICKET_A2A_URL: http://ticket-a2a:5006
+  TRIP_A2A_URL: http://trip-a2a:5007
+  # 主 API 服务绑定地址与端口
+  SMARTVOYAGE_API_HOST: 0.0.0.0
+  SMARTVOYAGE_API_PORT: "8080"
+  SMARTVOYAGE_MODE: live
+  SMARTVOYAGE_APP_DB: /app/ai01_SmartVoyage/data/smartvoyage.sqlite3
+  SMARTVOYAGE_COOKIE_SECURE: ${SMARTVOYAGE_COOKIE_SECURE:-0}
+
+# ---- 共享服务配置锚点：构建方式、重启策略、网络和环境 ----
+x-smartvoyage-service: &smartvoyage-service
+  build:
+    context: .               # 构建上下文为项目根目录
+    dockerfile: Dockerfile   # 使用根目录的 Dockerfile
+  image: smartvoyage:latest  # 构建产物的镜像名
+  restart: unless-stopped    # 异常退出时自动重启
+  environment: *smartvoyage-env  # 引用上面的共享环境变量
+  networks:
+    - smartvoyage            # 加入自定义网络，服务间按名称互相访问
+
+services:
+  # ============ MySQL 关系数据库 ============
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4         # 使用 utf8mb4 支持中文和 emoji
+      - --collation-server=utf8mb4_unicode_ci  # 排序规则
+      - --default-time-zone=+08:00             # 默认时区设为北京时间
+    environment:
+      MYSQL_ROOT_PASSWORD: ${SMARTVOYAGE_DB_PASSWORD:-smartvoyage}  # root 密码
+      MYSQL_DATABASE: ${SMARTVOYAGE_DB_NAME:-travel_rag}             # 自动创建数据库
+    expose:
+      - "3306"                                 # 只在容器网络内暴露，不映射到宿主机
+    volumes:
+      - mysql_data:/var/lib/mysql              # 数据持久化
+      # 首次启动时自动执行建表和数据初始化脚本（按文件名顺序）
+      - ./sql/create_all_tables.sql:/docker-entrypoint-initdb.d/01_create_all_tables.sql:ro
+      - ./sql/insert_may01_data.sql:/docker-entrypoint-initdb.d/02_insert_may01_data.sql:ro
+    healthcheck:                               # 健康检查：用 mysqladmin ping 探活
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - smartvoyage
+
+  # ============ 天气 MCP 工具服务 ============
+  weather-mcp:
+    <<: *smartvoyage-service                   # 复用共享服务配置
+    command: ["python", "-m", "ai01_SmartVoyage.mcp_server.mcp_weather_server"]  # 启动命令
+    depends_on:
+      mysql:
+        condition: service_healthy             # 等 MySQL 健康后才启动
+    expose:
+      - "8002"
+    healthcheck:                               # 用 socket 探测 8002 端口是否监听
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8002), 2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ============ 票务 MCP 工具服务 ============
+  ticket-mcp:
+    <<: *smartvoyage-service
+    command: ["python", "-m", "ai01_SmartVoyage.mcp_server.mcp_ticket_server"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    expose:
+      - "8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8001), 2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ============ 行程 MCP 工具服务 ============
+  trip-mcp:
+    <<: *smartvoyage-service
+    command: ["python", "-m", "ai01_SmartVoyage.mcp_server.mcp_trip_server"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    expose:
+      - "8003"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8003), 2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ============ 天气 A2A 专家服务 ============
+  weather-a2a:
+    <<: *smartvoyage-service
+    command: ["python", "-m", "ai01_SmartVoyage.a2a_server.weather_server"]
+    depends_on:
+      weather-mcp:
+        condition: service_healthy             # 等天气 MCP 健康后再启动
+    expose:
+      - "5005"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 5005), 2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ============ 票务 A2A 专家服务 ============
+  ticket-a2a:
+    <<: *smartvoyage-service
+    command: ["python", "-m", "ai01_SmartVoyage.a2a_server.ticket_server"]
+    depends_on:
+      ticket-mcp:
+        condition: service_healthy
+    expose:
+      - "5006"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 5006), 2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ============ 行程 A2A 专家服务 ============
+  trip-a2a:
+    <<: *smartvoyage-service
+    command: ["python", "-m", "ai01_SmartVoyage.a2a_server.trip_server"]
+    depends_on:
+      trip-mcp:
+        condition: service_healthy
+    expose:
+      - "5007"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 5007), 2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ============ 主 API 服务（FastAPI 页面 + 接口） ============
+  api:
+    <<: *smartvoyage-service
+    volumes:
+      - application_data:/app/ai01_SmartVoyage/data
+    command: ["python", "-m", "ai01_SmartVoyage.api.server"]
+    depends_on:
+      weather-a2a:
+        condition: service_healthy
+      ticket-a2a:
+        condition: service_healthy
+      trip-a2a:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${SMARTVOYAGE_API_HOST_PORT:-8080}:8080"  # 默认仅本机访问
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ============ 以下为可选向量检索组件（--profile vectors 启用） ============
+
+  # etcd：Milvus 的元数据存储依赖
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    profiles: ["vectors"]                      # 默认不启动，需 --profile vectors
+    restart: unless-stopped
+    command:
+      - etcd
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    networks:
+      - smartvoyage
+
+  # minio：Milvus 的对象存储依赖
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    profiles: ["vectors"]
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: ["server", "/minio_data", "--console-address", ":9001"]
+    expose:
+      - "9000"
+      - "9001"
+    volumes:
+      - minio_data:/minio_data
+    networks:
+      - smartvoyage
+
+  # milvus：向量数据库，提供旅游团语义检索能力
+  milvus:
+    image: milvusdb/milvus:v2.4.15
+    profiles: ["vectors"]
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]   # 单机模式
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    depends_on:
+      - etcd
+      - minio
+    expose:
+      - "19530"
+      - "9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    networks:
+      - smartvoyage
+
+# 自定义网络：让所有服务在同一网络内通过服务名互相访问
+networks:
+  smartvoyage:
+
+# 命名卷：持久化数据库和向量数据，容器重建后数据不丢失
+volumes:
+  application_data:
+  mysql_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
